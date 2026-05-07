@@ -2,6 +2,7 @@ package users
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -9,14 +10,15 @@ import (
 	"github.com/antiwork/gumroad-cli/internal/testutil"
 )
 
-func TestUpdateEmail_RequiresBothFlags(t *testing.T) {
+func TestUpdateEmail_RequiresIdentifierAndNewEmail(t *testing.T) {
 	cases := []struct {
 		name string
 		args []string
 		want string
 	}{
-		{"missing-current", []string{"--new-email", "new@example.com"}, "missing required flag: --current-email"},
-		{"missing-new", []string{"--current-email", "old@example.com"}, "missing required flag: --new-email"},
+		{"missing-identifier", []string{"--new-email", "new@example.com"}, "supply --current-email or --external-id"},
+		{"missing-new-with-current", []string{"--current-email", "old@example.com"}, "missing required flag: --new-email"},
+		{"missing-new-with-external", []string{"--external-id", "2245593582708"}, "missing required flag: --new-email"},
 	}
 
 	for _, tc := range cases {
@@ -28,6 +30,120 @@ func TestUpdateEmail_RequiresBothFlags(t *testing.T) {
 				t.Fatalf("got %v, want error containing %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestUpdateEmail_PostsExternalIDAndNewEmail(t *testing.T) {
+	var body updateEmailRequest
+
+	testutil.SetupAdmin(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if strings.Contains(string(raw), `"current_email"`) {
+			t.Errorf("current_email field must be omitted when only --external-id is supplied, got %q", raw)
+		}
+		testutil.JSON(t, w, map[string]any{
+			"message":              "Email change pending confirmation",
+			"unconfirmed_email":    "new@example.com",
+			"pending_confirmation": true,
+		})
+	})
+
+	cmd := testutil.Command(newUpdateEmailCmd(), testutil.Yes(true), testutil.Quiet(false))
+	cmd.SetArgs([]string{"--external-id", "2245593582708", "--new-email", "new@example.com"})
+	out := testutil.CaptureStdout(func() { testutil.MustExecute(t, cmd) })
+
+	if body.ExternalID != "2245593582708" || body.CurrentEmail != "" || body.NewEmail != "new@example.com" {
+		t.Errorf("got current=%q external_id=%q new=%q, want only external_id + new_email", body.CurrentEmail, body.ExternalID, body.NewEmail)
+	}
+	if !strings.Contains(out, "External ID: 2245593582708") {
+		t.Errorf("when only --external-id is supplied the identifier line must use the External ID label, not the Current label that connotes an email: %q", out)
+	}
+	if strings.Contains(out, "Current: 2245593582708") {
+		t.Errorf("Current label must not carry the external_id (reads as if the external_id were the current email): %q", out)
+	}
+}
+
+func TestUpdateEmail_FallbackHeadlineQualifiesExternalID(t *testing.T) {
+	testutil.SetupAdmin(t, func(w http.ResponseWriter, r *http.Request) {
+		testutil.JSON(t, w, map[string]any{
+			"message":              "",
+			"unconfirmed_email":    "new@example.com",
+			"pending_confirmation": true,
+		})
+	})
+
+	cmd := testutil.Command(newUpdateEmailCmd(), testutil.Yes(true), testutil.Quiet(false))
+	cmd.SetArgs([]string{"--external-id", "2245593582708", "--new-email", "new@example.com"})
+	out := testutil.CaptureStdout(func() { testutil.MustExecute(t, cmd) })
+
+	if !strings.Contains(out, "external_id 2245593582708 → new@example.com") {
+		t.Errorf("fallback headline must qualify the external_id (without this prefix it reads as an email→email change): %q", out)
+	}
+	if strings.Contains(out, ": 2245593582708 → ") {
+		t.Errorf("fallback headline must not place a bare external_id where an email is expected: %q", out)
+	}
+}
+
+func TestUpdateEmail_LabelStaysCurrentWhenCurrentEmailSupplied(t *testing.T) {
+	testutil.SetupAdmin(t, func(w http.ResponseWriter, r *http.Request) {
+		testutil.JSON(t, w, map[string]any{
+			"message":              "",
+			"unconfirmed_email":    "new@example.com",
+			"pending_confirmation": true,
+		})
+	})
+
+	cmd := testutil.Command(newUpdateEmailCmd(), testutil.Yes(true), testutil.Quiet(false))
+	cmd.SetArgs([]string{"--current-email", "old@example.com", "--new-email", "new@example.com"})
+	out := testutil.CaptureStdout(func() { testutil.MustExecute(t, cmd) })
+
+	if !strings.Contains(out, "Current: old@example.com") {
+		t.Errorf("when --current-email is supplied the identifier line must keep the Current label: %q", out)
+	}
+	if strings.Contains(out, "External ID:") {
+		t.Errorf("External ID label must not appear when --external-id is not supplied: %q", out)
+	}
+	if !strings.Contains(out, "Email change pending confirmation: old@example.com → new@example.com") {
+		t.Errorf("email-supplied headline must not be qualified with external_id: %q", out)
+	}
+}
+
+func TestUpdateEmail_ForwardsBothCurrentEmailAndExternalID(t *testing.T) {
+	var body updateEmailRequest
+
+	testutil.SetupAdmin(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		testutil.JSON(t, w, map[string]any{
+			"message":              "Email change pending confirmation",
+			"unconfirmed_email":    "new@example.com",
+			"pending_confirmation": true,
+		})
+	})
+
+	cmd := testutil.Command(newUpdateEmailCmd(), testutil.Yes(true))
+	cmd.SetArgs([]string{
+		"--current-email", "old@example.com",
+		"--external-id", "2245593582708",
+		"--new-email", "new@example.com",
+	})
+	testutil.MustExecute(t, cmd)
+
+	if body.CurrentEmail != "old@example.com" {
+		t.Errorf("got current_email %q, want old@example.com", body.CurrentEmail)
+	}
+	if body.ExternalID != "2245593582708" {
+		t.Errorf("got external_id %q, want 2245593582708", body.ExternalID)
+	}
+	if body.NewEmail != "new@example.com" {
+		t.Errorf("got new_email %q, want new@example.com", body.NewEmail)
 	}
 }
 
