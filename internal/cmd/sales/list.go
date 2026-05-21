@@ -1,8 +1,12 @@
 package sales
 
 import (
+	"bytes"
+	"encoding/csv"
 	"io"
 	"net/url"
+	"strconv"
+	"strings"
 
 	"github.com/antiwork/gumroad-cli/internal/api"
 	"github.com/antiwork/gumroad-cli/internal/cmdutil"
@@ -12,12 +16,19 @@ import (
 )
 
 type saleListItem struct {
-	ID             string `json:"id"`
-	Email          string `json:"email"`
-	ProductName    string `json:"product_name"`
-	FormattedTotal string `json:"formatted_total_price"`
-	CreatedAt      string `json:"created_at"`
-	Refunded       bool   `json:"refunded"`
+	ID                  string       `json:"id"`
+	Email               string       `json:"email"`
+	ProductName         string       `json:"product_name"`
+	FormattedTotal      string       `json:"formatted_total_price"`
+	CreatedAt           string       `json:"created_at"`
+	Refunded            bool         `json:"refunded"`
+	TotalCents          *nullableInt `json:"total_cents"`
+	Price               *nullableInt `json:"price"`
+	Currency            string       `json:"currency"`
+	CurrencyType        string       `json:"currency_type"`
+	PriceCurrencyType   string       `json:"price_currency_type"`
+	RefundedCents       *nullableInt `json:"refunded_cents"`
+	AmountRefundedCents *nullableInt `json:"amount_refunded_cents"`
 }
 
 type salesListResponse struct {
@@ -26,9 +37,35 @@ type salesListResponse struct {
 	NextPageKey string         `json:"next_page_key,omitempty"`
 }
 
+type nullableInt struct {
+	value api.JSONInt
+	valid bool
+}
+
+func (n *nullableInt) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		n.valid = false
+		n.value = 0
+		return nil
+	}
+
+	if err := n.value.UnmarshalJSON(data); err != nil {
+		return err
+	}
+	n.valid = true
+	return nil
+}
+
+func (n nullableInt) MarshalJSON() ([]byte, error) {
+	if !n.valid {
+		return []byte("null"), nil
+	}
+	return []byte(strconv.Itoa(int(n.value))), nil
+}
+
 func newListCmd() *cobra.Command {
 	var product, email, orderID, before, after, pageKey string
-	var all bool
+	var all, csvOutput bool
 
 	cmd := &cobra.Command{
 		Use:   "list",
@@ -36,10 +73,14 @@ func newListCmd() *cobra.Command {
 		Args:  cmdutil.ExactArgs(0),
 		Example: `  gumroad sales list
   gumroad sales list --product <id> --after 2024-01-01
+  gumroad sales list --after 2024-01-01 --csv
   gumroad sales list --all
   gumroad sales list --json --jq '.sales[0].id'`,
 		RunE: func(c *cobra.Command, args []string) error {
 			opts := cmdutil.OptionsFrom(c)
+			if err := validateSalesCSVOutput(c, opts, csvOutput); err != nil {
+				return err
+			}
 			if err := cmdutil.RequireDateFlag(c, "before", before); err != nil {
 				return err
 			}
@@ -67,11 +108,11 @@ func newListCmd() *cobra.Command {
 				params.Set("page_key", pageKey)
 			}
 			if all {
-				return streamSalesListAll(opts, params)
+				return streamSalesListAll(opts, params, csvOutput)
 			}
 
 			return cmdutil.RunRequestDecoded[salesListResponse](opts, "Fetching sales...", "GET", "/sales", params, func(resp salesListResponse) error {
-				return renderSalesList(opts, resp, product, email, orderID, before, after)
+				return renderSalesList(opts, resp, product, email, orderID, before, after, csvOutput)
 			})
 		},
 	}
@@ -83,12 +124,30 @@ func newListCmd() *cobra.Command {
 	cmd.Flags().StringVar(&after, "after", "", "Filter sales after date (YYYY-MM-DD)")
 	cmd.Flags().StringVar(&pageKey, "page-key", "", "Pagination cursor")
 	cmd.Flags().BoolVar(&all, "all", false, "Fetch all pages")
+	cmd.Flags().BoolVar(&csvOutput, "csv", false, "Output as CSV")
 	cmd.MarkFlagsMutuallyExclusive("all", "page-key")
 
 	return cmd
 }
 
-func renderSalesList(opts cmdutil.Options, resp salesListResponse, product, email, orderID, before, after string) error {
+func validateSalesCSVOutput(cmd *cobra.Command, opts cmdutil.Options, csvOutput bool) error {
+	if !csvOutput {
+		return nil
+	}
+	if opts.JSONOutput || opts.JQExpr != "" || opts.PlainOutput {
+		return cmdutil.NewUsageError(cmd, "--csv cannot be combined with --json, --jq, or --plain")
+	}
+	return nil
+}
+
+func renderSalesList(opts cmdutil.Options, resp salesListResponse, product, email, orderID, before, after string, csvOutput bool) error {
+	if csvOutput {
+		if err := writeSalesCSV(opts.Out(), resp.Sales); err != nil {
+			return err
+		}
+		return renderSalesCSVPageHint(opts, product, email, orderID, before, after, resp.NextPageKey)
+	}
+
 	if len(resp.Sales) == 0 {
 		return renderEmptySalesList(opts, product, email, orderID, before, after, resp.NextPageKey)
 	}
@@ -110,7 +169,16 @@ func renderSalesList(opts cmdutil.Options, resp salesListResponse, product, emai
 	})
 }
 
-func streamSalesListAll(opts cmdutil.Options, params url.Values) error {
+func renderSalesCSVPageHint(opts cmdutil.Options, product, email, orderID, before, after, nextPageKey string) error {
+	if nextPageKey == "" || opts.Quiet {
+		return nil
+	}
+
+	hint := salesCSVAllHint(product, email, orderID, before, after)
+	return output.Writeln(opts.Err(), opts.Style().Dim("More results available: "+hint))
+}
+
+func streamSalesListAll(opts cmdutil.Options, params url.Values, csvOutput bool) error {
 	token, err := config.Token()
 	if err != nil {
 		return err
@@ -126,6 +194,10 @@ func streamSalesListAll(opts cmdutil.Options, params url.Values) error {
 	style := opts.Style()
 	walkPages := func(visit cmdutil.PageVisitor[salesListResponse]) error {
 		return walkSalesPages(opts, client, params, visit)
+	}
+
+	if csvOutput {
+		return streamSalesCSV(opts.Out(), walkPages)
 	}
 
 	return cmdutil.StreamPaginatedPages(opts, cmdutil.PaginatedPageOutputConfig[salesListResponse]{
@@ -170,6 +242,82 @@ func writeSalesPlain(w io.Writer, sales []saleListItem) error {
 	return output.PrintPlain(w, rows)
 }
 
+var salesCSVHeader = []string{"id", "email", "product_name", "total_cents", "currency", "refunded", "refunded_cents", "created_at"}
+
+func writeSalesCSV(w io.Writer, sales []saleListItem) error {
+	cw := csv.NewWriter(w)
+	if err := writeSalesCSVHeader(cw); err != nil {
+		return err
+	}
+	if err := writeSalesCSVRows(cw, sales); err != nil {
+		return err
+	}
+	cw.Flush()
+	return cw.Error()
+}
+
+func streamSalesCSV(w io.Writer, walkPages func(cmdutil.PageVisitor[salesListResponse]) error) error {
+	cw := csv.NewWriter(w)
+	if err := writeSalesCSVHeader(cw); err != nil {
+		return err
+	}
+	err := walkPages(func(page salesListResponse) (bool, error) {
+		return false, writeSalesCSVRows(cw, page.Sales)
+	})
+	cw.Flush()
+	if err != nil {
+		return err
+	}
+	return cw.Error()
+}
+
+func writeSalesCSVHeader(cw *csv.Writer) error {
+	return cw.Write(salesCSVHeader)
+}
+
+func writeSalesCSVRows(cw *csv.Writer, sales []saleListItem) error {
+	for _, s := range sales {
+		if err := cw.Write([]string{
+			s.ID,
+			s.Email,
+			s.ProductName,
+			formatNullableInt(firstNullableInt(s.TotalCents, s.Price)),
+			s.csvCurrency(),
+			strconv.FormatBool(s.Refunded),
+			formatNullableInt(firstNullableInt(s.RefundedCents, s.AmountRefundedCents)),
+			s.CreatedAt,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s saleListItem) csvCurrency() string {
+	for _, value := range []string{s.Currency, s.CurrencyType, s.PriceCurrencyType} {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func firstNullableInt(values ...*nullableInt) *nullableInt {
+	for _, value := range values {
+		if value != nil && value.valid {
+			return value
+		}
+	}
+	return nil
+}
+
+func formatNullableInt(value *nullableInt) string {
+	if value == nil {
+		return "0"
+	}
+	return strconv.Itoa(int(value.value))
+}
+
 func writeSalesTable(w io.Writer, style output.Styler, sales []saleListItem) error {
 	tbl := output.NewStyledTable(style, "ID", "EMAIL", "PRODUCT", "TOTAL", "DATE")
 	for _, s := range sales {
@@ -205,5 +353,17 @@ func salesPaginationHint(product, email, orderID, before, after, nextPageKey str
 		cmdutil.CommandArg{Flag: "--before", Value: before},
 		cmdutil.CommandArg{Flag: "--after", Value: after},
 		cmdutil.CommandArg{Flag: "--page-key", Value: nextPageKey},
+	)
+}
+
+func salesCSVAllHint(product, email, orderID, before, after string) string {
+	return cmdutil.ReplayCommand("gumroad sales list",
+		cmdutil.CommandArg{Flag: "--product", Value: product},
+		cmdutil.CommandArg{Flag: "--email", Value: email},
+		cmdutil.CommandArg{Flag: "--order", Value: orderID},
+		cmdutil.CommandArg{Flag: "--before", Value: before},
+		cmdutil.CommandArg{Flag: "--after", Value: after},
+		cmdutil.CommandArg{Flag: "--all", Boolean: true},
+		cmdutil.CommandArg{Flag: "--csv", Boolean: true},
 	)
 }
