@@ -197,9 +197,115 @@ func printMutationPayload(opts Options, payload mutationOutput) error {
 }
 
 // PrintMutationSuccess renders a successful mutating command with the shared
-// human/plain/JSON envelope used across the CLI.
+// {success, message, id, result} envelope used across most of the CLI. Prefer
+// PrintResourceSuccess when the API already returns the resource at the top
+// level and the write verb should match the read verbs' shape.
 func PrintMutationSuccess(opts Options, data json.RawMessage, id, successMessage string) error {
 	return renderMutationSuccess(opts, data, id, successMessage)
+}
+
+// PrintResourceSuccess renders a successful mutation by passing the API response
+// through unchanged in JSON mode, with no result envelope. Write verbs then
+// match their read verbs: a resource stays at the same top-level path (e.g.
+// product), and a response that carries only a message (e.g. delete) surfaces
+// that message verbatim. Human and plain output show successMessage.
+//
+// When id is non-empty and the JSON response has no top-level "id", id is merged
+// in so callers can still correlate the affected resource. This matters for
+// irreversible verbs whose response omits the resource entirely (delete returns
+// only {success, message}); pass an empty id for verbs that already return the
+// resource, leaving the response byte-for-byte unchanged.
+func PrintResourceSuccess(opts Options, data json.RawMessage, id, successMessage string) error {
+	if opts.UsesJSONOutput() {
+		merged, err := withTopLevelID(data, id)
+		if err != nil {
+			return err
+		}
+		return PrintJSONResponse(opts, merged)
+	}
+	if opts.PlainOutput {
+		return output.PrintPlain(opts.Out(), [][]string{{"true", successMessage}})
+	}
+	return PrintSuccess(opts, successMessage)
+}
+
+// RunRequestWithResource executes a mutating API request and renders it with
+// PrintResourceSuccess, passing the API response through unchanged in JSON mode.
+// It is the envelope-free counterpart to RunRequestWithSuccess. See
+// PrintResourceSuccess for the id parameter's semantics.
+func RunRequestWithResource(opts Options, spinnerMessage, method, path string, params url.Values, id, successMessage string) error {
+	if opts.DryRun && method != http.MethodGet {
+		return PrintDryRunRequest(opts, method, path, params)
+	}
+
+	data, err := runAuthenticatedData(opts, spinnerMessage, requestRunner(method, path, params))
+	if err != nil {
+		return err
+	}
+	return PrintResourceSuccess(opts, data, id, successMessage)
+}
+
+// withTopLevelID returns data with a top-level "id" field set to id. It is a
+// no-op when id is empty or the response already carries a top-level "id", so
+// responses that already expose the resource pass through unchanged. The id is
+// appended after the existing fields, preserving the API's original key order.
+func withTopLevelID(data json.RawMessage, id string) (json.RawMessage, error) {
+	if id == "" {
+		return data, nil
+	}
+	normalized := normalizeJSONBody(data)
+	fields := map[string]json.RawMessage{}
+	if err := json.Unmarshal(normalized, &fields); err != nil {
+		return nil, fmt.Errorf("could not parse response: %w", err)
+	}
+	if _, ok := fields["id"]; ok {
+		return data, nil
+	}
+	idData, err := json.Marshal(id)
+	if err != nil {
+		return nil, fmt.Errorf("could not encode id: %w", err)
+	}
+	object := normalized
+	if bytes.Equal(bytes.TrimSpace(object), []byte("null")) {
+		object = nil
+	}
+	return AppendJSONField(object, "id", idData)
+}
+
+// AppendJSONField returns object with key:value appended as a top-level field,
+// preserving the order of any existing fields. A nil, empty, or whitespace-only
+// object yields {"key":value}. It returns an error when object is non-empty but
+// not a JSON object. Surrounding whitespace is tolerated.
+func AppendJSONField(object json.RawMessage, key string, value json.RawMessage) (json.RawMessage, error) {
+	keyData, err := json.Marshal(key)
+	if err != nil {
+		return nil, fmt.Errorf("could not encode response key: %w", err)
+	}
+	object = bytes.TrimSpace(object)
+	if len(object) == 0 {
+		out := make([]byte, 0, len(keyData)+len(value)+4)
+		out = append(out, '{')
+		out = append(out, keyData...)
+		out = append(out, ':')
+		out = append(out, value...)
+		out = append(out, '}')
+		return out, nil
+	}
+	if !json.Valid(object) || len(object) < 2 || object[0] != '{' || object[len(object)-1] != '}' {
+		return nil, fmt.Errorf("could not parse response: expected JSON object")
+	}
+	inner := bytes.TrimSpace(object[1 : len(object)-1])
+	out := make([]byte, 0, len(object)+len(keyData)+len(value)+2)
+	out = append(out, '{')
+	if len(inner) > 0 {
+		out = append(out, inner...)
+		out = append(out, ',')
+	}
+	out = append(out, keyData...)
+	out = append(out, ':')
+	out = append(out, value...)
+	out = append(out, '}')
+	return out, nil
 }
 
 func renderMutationSuccess(opts Options, data json.RawMessage, id, successMessage string) error {
