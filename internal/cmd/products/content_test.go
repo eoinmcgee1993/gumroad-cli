@@ -145,6 +145,54 @@ func TestContentGet_VariantProjectsVariantRichContent(t *testing.T) {
 	}
 }
 
+func TestContentGet_PageProjectsSinglePage(t *testing.T) {
+	testutil.Setup(t, func(w http.ResponseWriter, r *http.Request) {
+		testutil.JSON(t, w, sharedContentProductResponse([]map[string]any{
+			contentPageWithBlocks("page_1", "Start", 0, 1),
+			contentPageWithBlocks("page_2", "Files", 1, 2),
+		}))
+	})
+
+	cmd := testutil.Command(newContentGetCmd(), testutil.JSONOutput())
+	cmd.SetArgs([]string{"prod_123", "--page", "page_2"})
+	out := testutil.CaptureStdout(func() {
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("Execute failed: %v", err)
+		}
+	})
+
+	var page map[string]any
+	if err := json.Unmarshal([]byte(out), &page); err != nil {
+		t.Fatalf("output is not a page JSON object: %v\n%s", err, out)
+	}
+	if page["id"] != "page_2" || page["title"] != "Files" {
+		t.Fatalf("unexpected page projection: %#v", page)
+	}
+	if strings.Contains(out, `"page_1"`) || strings.HasPrefix(strings.TrimSpace(out), "[") {
+		t.Fatalf("content get --page should print only one page object: %s", out)
+	}
+}
+
+func TestContentGet_PageNotFoundErrors(t *testing.T) {
+	testutil.Setup(t, func(w http.ResponseWriter, r *http.Request) {
+		testutil.JSON(t, w, sharedContentProductResponse([]map[string]any{
+			contentPage("page_1", "Start", 0),
+		}))
+	})
+
+	cmd := testutil.Command(newContentGetCmd(), testutil.JSONOutput())
+	cmd.SetArgs([]string{"prod_123", "--page", "missing_page"})
+	err := cmd.Execute()
+
+	if err == nil || !strings.Contains(err.Error(), "rich content page missing_page not found") {
+		t.Fatalf("expected page-not-found error, got %v", err)
+	}
+	var invalidInputErr *cmdutil.InvalidInputError
+	if !errors.As(err, &invalidInputErr) {
+		t.Fatalf("expected invalid input error, got %T", err)
+	}
+}
+
 func TestContentGet_VariantRequiresCategoryBeforeAPI(t *testing.T) {
 	var calls int
 	testutil.Setup(t, func(w http.ResponseWriter, r *http.Request) {
@@ -246,6 +294,76 @@ func TestContentHelpDocumentsWholeDocumentDeletion(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("content set help missing %q: %q", want, text)
 		}
+	}
+}
+
+func TestContentList_JSONSummarizesPages(t *testing.T) {
+	testutil.Setup(t, func(w http.ResponseWriter, r *http.Request) {
+		testutil.JSON(t, w, sharedContentProductResponse([]map[string]any{
+			contentPageWithBlocks("page_1", "Start", 0, 1),
+			contentPageWithBlocks("page_2", "Files", 1, 3),
+		}))
+	})
+
+	cmd := testutil.Command(newContentListCmd(), testutil.JSONOutput())
+	cmd.SetArgs([]string{"prod_123"})
+	out := testutil.CaptureStdout(func() {
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("Execute failed: %v", err)
+		}
+	})
+
+	var pages []productContentPageSummary
+	if err := json.Unmarshal([]byte(out), &pages); err != nil {
+		t.Fatalf("output is not page summary JSON: %v\n%s", err, out)
+	}
+	if len(pages) != 2 {
+		t.Fatalf("got %d summaries, want 2: %#v", len(pages), pages)
+	}
+	if pages[1].ID != "page_2" || pages[1].Title != "Files" || pages[1].BlockCount != 3 {
+		t.Fatalf("unexpected page summary: %#v", pages[1])
+	}
+	if pages[1].Position == nil || int(*pages[1].Position) != 1 {
+		t.Fatalf("unexpected page position: %#v", pages[1].Position)
+	}
+}
+
+func TestContentList_PlainVariantSummarizesVariantPages(t *testing.T) {
+	var productGetCalls, variantGetCalls int
+	testutil.Setup(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/products/prod_123":
+			productGetCalls++
+			testutil.JSON(t, w, perVariantContentProductResponse())
+		case "/products/prod_123/variant_categories/cat_123/variants/var_123":
+			variantGetCalls++
+			testutil.JSON(t, w, map[string]any{
+				"success": true,
+				"variant": map[string]any{
+					"id": "var_123",
+					"rich_content": []map[string]any{
+						contentPageWithBlocks("variant_page_1", "Variant files", 0, 2),
+					},
+				},
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusNotFound)
+		}
+	})
+
+	var out bytes.Buffer
+	cmd := testutil.Command(newContentListCmd(), testutil.PlainOutput(), testutil.Stdout(&out))
+	cmd.SetArgs([]string{"prod_123", "--variant", "var_123", "--category", "cat_123"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	if productGetCalls != 1 || variantGetCalls != 1 {
+		t.Fatalf("GET calls: product=%d variant=%d, want 1 each", productGetCalls, variantGetCalls)
+	}
+	if got, want := out.String(), "variant_page_1\tVariant files\t0\t2\n"; got != want {
+		t.Fatalf("got plain output %q, want %q", got, want)
 	}
 }
 
@@ -354,6 +472,204 @@ func TestContentSet_VariantSendsWholeDocumentJSON(t *testing.T) {
 	pages := richContentPagesFromBody(t, variantPutBody)
 	if len(pages) != 1 || pages[0]["id"] != "variant_page_1" {
 		t.Fatalf("variant set should send exactly the provided document, got %#v", pages)
+	}
+}
+
+func TestContentSet_PageMergesSinglePageJSON(t *testing.T) {
+	path := writeContentFixture(t, `{"id":"page_2","title":"Updated files","position":1,"description":{"type":"doc","content":[{"type":"paragraph"}]}}`)
+	var putBody map[string]any
+
+	testutil.Setup(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			testutil.JSON(t, w, sharedContentProductResponse([]map[string]any{
+				contentPage("page_1", "Start", 0),
+				contentPage("page_2", "Old files", 1),
+				contentPage("page_3", "Extras", 2),
+			}))
+		case http.MethodPut:
+			if err := json.NewDecoder(r.Body).Decode(&putBody); err != nil {
+				t.Fatalf("decode PUT body: %v", err)
+			}
+			testutil.JSON(t, w, map[string]any{"success": true, "product": map[string]any{"id": "prod_123"}})
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	})
+
+	cmd := testutil.Command(newContentSetCmd())
+	cmd.SetArgs([]string{"prod_123", path, "--page", "page_2"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	pages := richContentPagesFromBody(t, putBody)
+	if len(pages) != 3 {
+		t.Fatalf("page-scoped set should preserve sibling pages, got %#v", pages)
+	}
+	if pages[0]["id"] != "page_1" || pages[2]["id"] != "page_3" {
+		t.Fatalf("page-scoped set changed sibling pages: %#v", pages)
+	}
+	if pages[1]["id"] != "page_2" || pages[1]["title"] != "Updated files" {
+		t.Fatalf("page-scoped set did not replace page_2: %#v", pages[1])
+	}
+}
+
+func TestContentSet_PageDefaultsToPageJSON(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if err := os.WriteFile("page.json", []byte(`{"id":"page_2","title":"Default page file","position":1,"description":{"type":"doc","content":[]}}`), 0600); err != nil {
+		t.Fatalf("write page.json: %v", err)
+	}
+	var putBody map[string]any
+
+	testutil.Setup(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			testutil.JSON(t, w, sharedContentProductResponse([]map[string]any{
+				contentPage("page_1", "Start", 0),
+				contentPage("page_2", "Old files", 1),
+			}))
+		case http.MethodPut:
+			if err := json.NewDecoder(r.Body).Decode(&putBody); err != nil {
+				t.Fatalf("decode PUT body: %v", err)
+			}
+			testutil.JSON(t, w, map[string]any{"success": true, "product": map[string]any{"id": "prod_123"}})
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	})
+
+	cmd := testutil.Command(newContentSetCmd())
+	cmd.SetArgs([]string{"prod_123", "--page", "page_2"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	pages := richContentPagesFromBody(t, putBody)
+	if len(pages) != 2 || pages[1]["title"] != "Default page file" {
+		t.Fatalf("page-scoped set did not read default page.json: %#v", pages)
+	}
+}
+
+func TestReadProductContentPageInput_EmptyPathDefaultsToPageJSON(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if err := os.WriteFile("content.json", []byte(`[{"id":"page_1","title":"Wrong default","position":0,"description":{"type":"doc","content":[]}}]`), 0600); err != nil {
+		t.Fatalf("write content.json: %v", err)
+	}
+	if err := os.WriteFile("page.json", []byte(`{"id":"page_2","title":"Page default","position":1,"description":{"type":"doc","content":[]}}`), 0600); err != nil {
+		t.Fatalf("write page.json: %v", err)
+	}
+
+	input, err := readProductContentPageInput(bytes.NewBuffer(nil), "")
+	if err != nil {
+		t.Fatalf("readProductContentPageInput failed: %v", err)
+	}
+	if input.Source != defaultProductContentPagePath {
+		t.Fatalf("page input source = %q, want %q", input.Source, defaultProductContentPagePath)
+	}
+	var page map[string]any
+	if err := json.Unmarshal(input.Page, &page); err != nil {
+		t.Fatalf("page input is not JSON object: %v", err)
+	}
+	if page["id"] != "page_2" {
+		t.Fatalf("page input read wrong default file: %#v", page)
+	}
+}
+
+func TestContentSet_PageIDMismatchDoesNotPUT(t *testing.T) {
+	path := writeContentFixture(t, `{"id":"page_3","title":"Wrong page","position":1,"description":{"type":"doc","content":[]}}`)
+	var putCalls int
+
+	testutil.Setup(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			testutil.JSON(t, w, sharedContentProductResponse([]map[string]any{
+				contentPage("page_1", "Start", 0),
+				contentPage("page_2", "Files", 1),
+			}))
+		case http.MethodPut:
+			putCalls++
+			http.Error(w, "should not PUT mismatched page", http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	})
+
+	cmd := testutil.Command(newContentSetCmd())
+	cmd.SetArgs([]string{"prod_123", path, "--page", "page_2"})
+	err := cmd.Execute()
+
+	if err == nil || !strings.Contains(err.Error(), `id "page_3" does not match --page "page_2"`) {
+		t.Fatalf("expected page id mismatch error, got %v", err)
+	}
+	if putCalls != 0 {
+		t.Fatalf("mismatched page made %d PUT calls", putCalls)
+	}
+}
+
+func TestContentSet_PageIDWhitespaceMismatchDoesNotPUT(t *testing.T) {
+	path := writeContentFixture(t, `{"id":"page_2 ","title":"Whitespace page","position":1,"description":{"type":"doc","content":[]}}`)
+	var putCalls int
+
+	testutil.Setup(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			testutil.JSON(t, w, sharedContentProductResponse([]map[string]any{
+				contentPage("page_1", "Start", 0),
+				contentPage("page_2", "Files", 1),
+			}))
+		case http.MethodPut:
+			putCalls++
+			http.Error(w, "should not PUT mismatched page", http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	})
+
+	cmd := testutil.Command(newContentSetCmd())
+	cmd.SetArgs([]string{"prod_123", path, "--page", "page_2"})
+	err := cmd.Execute()
+
+	if err == nil || !strings.Contains(err.Error(), `id "page_2 " does not match --page "page_2"`) {
+		t.Fatalf("expected exact page id mismatch error, got %v", err)
+	}
+	if putCalls != 0 {
+		t.Fatalf("whitespace-mismatched page made %d PUT calls", putCalls)
+	}
+}
+
+func TestContentSet_PageNotFoundDoesNotPUT(t *testing.T) {
+	path := writeContentFixture(t, `{"id":"missing_page","title":"Missing","position":1,"description":{"type":"doc","content":[]}}`)
+	var putCalls int
+
+	testutil.Setup(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			testutil.JSON(t, w, sharedContentProductResponse([]map[string]any{
+				contentPage("page_1", "Start", 0),
+			}))
+		case http.MethodPut:
+			putCalls++
+			http.Error(w, "should not PUT missing page", http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	})
+
+	cmd := testutil.Command(newContentSetCmd())
+	cmd.SetArgs([]string{"prod_123", path, "--page", "missing_page"})
+	err := cmd.Execute()
+
+	if err == nil || !strings.Contains(err.Error(), "rich content page missing_page not found") {
+		t.Fatalf("expected page-not-found error, got %v", err)
+	}
+	if putCalls != 0 {
+		t.Fatalf("missing page made %d PUT calls", putCalls)
 	}
 }
 
@@ -809,6 +1125,12 @@ func TestProductContentHelpers(t *testing.T) {
 	if got := productContentPath([]string{"prod_123", "custom.json"}); got != "custom.json" {
 		t.Fatalf("got explicit content path %q, want custom.json", got)
 	}
+	if got := productContentPagePath([]string{"prod_123"}); got != defaultProductContentPagePath {
+		t.Fatalf("got default page path %q, want %q", got, defaultProductContentPagePath)
+	}
+	if got := productContentPagePath([]string{"prod_123", "custom-page.json"}); got != "custom-page.json" {
+		t.Fatalf("got explicit page path %q, want custom-page.json", got)
+	}
 
 	productTarget := productContentTarget{ProductID: "prod_123"}
 	if got := productTarget.mutationID(); got != "prod_123" {
@@ -906,13 +1228,21 @@ func perVariantContentProductResponse() map[string]any {
 }
 
 func contentPage(id, title string, position int) map[string]any {
+	return contentPageWithBlocks(id, title, position, 0)
+}
+
+func contentPageWithBlocks(id, title string, position, blockCount int) map[string]any {
+	blocks := make([]map[string]any, blockCount)
+	for i := range blocks {
+		blocks[i] = map[string]any{"type": "paragraph"}
+	}
 	return map[string]any{
 		"id":       id,
 		"title":    title,
 		"position": position,
 		"description": map[string]any{
 			"type":    "doc",
-			"content": []map[string]any{},
+			"content": blocks,
 		},
 	}
 }
