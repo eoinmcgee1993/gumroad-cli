@@ -106,12 +106,12 @@ func TestAffiliatesShowsNextCursorFooter(t *testing.T) {
 	}
 }
 
-func TestAffiliatesRequiresEmailOrUserID(t *testing.T) {
+func TestAffiliatesRequiresUserLookup(t *testing.T) {
 	cmd := newAffiliatesCmd()
 	cmd.SetArgs([]string{"--direction", "granted"})
 
 	err := cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "supply --email or --user-id") {
+	if err == nil || !strings.Contains(err.Error(), "supply --email, --user-id, or --username") {
 		t.Fatalf("expected missing identifier error, got %v", err)
 	}
 }

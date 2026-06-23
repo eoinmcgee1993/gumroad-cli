@@ -159,12 +159,12 @@ func TestRadarPlainOutputWithoutRecentEFWs(t *testing.T) {
 	}
 }
 
-func TestRadarRequiresEmailOrUserID(t *testing.T) {
+func TestRadarRequiresUserLookup(t *testing.T) {
 	cmd := newRadarCmd()
 	cmd.SetArgs([]string{})
 
 	err := cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "supply --email or --user-id") {
+	if err == nil || !strings.Contains(err.Error(), "supply --email, --user-id, or --username") {
 		t.Fatalf("expected missing identifier error, got %v", err)
 	}
 }

@@ -106,12 +106,12 @@ func TestRelatedDefaultOmitsSignalsAndLimit(t *testing.T) {
 	}
 }
 
-func TestRelatedRequiresEmailOrUserID(t *testing.T) {
+func TestRelatedRequiresUserLookup(t *testing.T) {
 	cmd := newRelatedCmd()
 	cmd.SetArgs([]string{"--signal", "ip"})
 
 	err := cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "supply --email or --user-id") {
+	if err == nil || !strings.Contains(err.Error(), "supply --email, --user-id, or --username") {
 		t.Fatalf("expected missing identifier error, got %v", err)
 	}
 }
