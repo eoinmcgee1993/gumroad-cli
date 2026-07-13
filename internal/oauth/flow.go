@@ -486,8 +486,19 @@ func pollDeviceTokenOnce(ctx context.Context, cfg FlowConfig, deviceCode string,
 			// A 200 means the server approved the login and may have already
 			// consumed the device code while issuing the token. Polling again
 			// with the same code can then fail with expired_token or
-			// invalid_grant even though the user approved, so surface the
-			// failure with a clear next step instead of retrying.
+			// invalid_grant even though the user approved.
+			//
+			// The read can fail after the full body already arrived (for
+			// example when the declared Content-Length overshoots the actual
+			// body). If the bytes we did receive form a valid token response,
+			// finish the login with them instead of throwing away a completed
+			// approval. Otherwise surface the failure with a clear next step
+			// instead of retrying.
+			if len(body) > 0 {
+				if result, parseErr := tokenResponseResult(body, "", ""); parseErr == nil {
+					return result, currentInterval, nil
+				}
+			}
 			return FlowResult{}, currentInterval, fmt.Errorf("connection failed while receiving the approved token; run the login command again: %w", err)
 		}
 		return FlowResult{}, currentInterval, &transientPollError{err: fmt.Errorf("could not read token response: %w", err)}
